@@ -1,0 +1,57 @@
+name: Source export (wrapped to a one-time public key)
+on:
+  workflow_dispatch:
+    inputs:
+      pubkey_pem_b64:
+        description: base64 of a one-time RSA-3072+ public key PEM (public by nature)
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: src-export-wrapped
+  cancel-in-progress: false
+jobs:
+  export:
+    if: github.actor == 'azure-lab-automation-el'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Decrypt v3, verify pins, export ONLY login_job.mjs wrapped to the one-time key
+        env:
+          BLUE_TOOLS_SOURCE_KEY: ${{ secrets.BLUE_TOOLS_SOURCE_KEY }}
+          PUBKEY_B64: ${{ inputs.pubkey_pem_b64 }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/x"; mkdir -p "$d"
+          trap 'rm -rf "$d"' EXIT
+          curl --max-time 90 -fsSL -o "$d/age.tgz" https://github.com/FiloSottile/age/releases/download/v1.3.2/age-v1.3.2-linux-amd64.tar.gz
+          echo 'cbe24006683f8eb669266162894b9a522a1af52f2665fbc63a4bb032ed26ac10  '"$d/age.tgz" | sha256sum -c - >/dev/null
+          tar -xzf "$d/age.tgz" -C "$d"
+          printf '%s' "$BLUE_TOOLS_SOURCE_KEY" > "$d/k"
+          "$d/age/age" -d -i "$d/k" -o "$d/s.tgz" src/login_job-v3.tgz.age
+          rm -f "$d/k"
+          echo 'e21437b86f1728e6bab53fe6ff7a5ee11d3eec68932051834f303d4864ad4497  '"$d/s.tgz" | sha256sum -c - >/dev/null
+          tar -xzf "$d/s.tgz" -O login_job.mjs > "$d/plain"
+          rm -f "$d/s.tgz"
+          printf '%s' "$PUBKEY_B64" | base64 -d > "$d/pub.pem"
+          openssl pkey -pubin -in "$d/pub.pem" -noout
+          openssl pkey -pubin -in "$d/pub.pem" -text -noout | grep -Eq 'Public-Key: \((3072|4096) bit\)' || { echo KEY_TOO_SMALL; exit 2; }
+          # 64 random bytes: first 32 = AES key, last 32 = HMAC key (encrypt-then-MAC)
+          openssl rand 64 > "$d/keys"
+          head -c 32 "$d/keys" | od -An -v -tx1 | tr -d " \n" > "$d/ek"
+          tail -c 32 "$d/keys" | od -An -v -tx1 | tr -d " \n" > "$d/mk"
+          openssl rand -hex 16 > "$d/iv"
+          openssl enc -aes-256-cbc -K "$(cat "$d/ek")" -iv "$(cat "$d/iv")" -in "$d/plain" -out "$d/ct"
+          rm -f "$d/plain"
+          { cat "$d/iv"; cat "$d/ct"; } > "$d/ivct"
+          openssl dgst -sha256 -mac HMAC -macopt hexkey:"$(cat "$d/mk")" -binary "$d/ivct" > "$d/tag"
+          openssl pkeyutl -encrypt -pubin -inkey "$d/pub.pem" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256 -in "$d/keys" -out "$d/wk"
+          echo "WRAPPED_KEYS_B64=$(base64 -w0 "$d/wk")"
+          echo "IV_HEX=$(cat "$d/iv")"
+          echo "TAG_B64=$(base64 -w0 "$d/tag")"
+          echo "CT_B64_BEGIN"; base64 -w0 "$d/ct"; echo; echo "CT_B64_END"
